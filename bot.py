@@ -26,14 +26,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не задан")
 
-TZ = ZoneInfo(
-    os.getenv("TZ", "Europe/Moscow")
-)
+TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 
-DB_PATH = os.getenv(
-    "DB_PATH",
-    "attendance.db"
-)
+DB_PATH = os.getenv("DB_PATH", "attendance.db")
 
 SCHEDULE_URL = "https://tt2.vogu35.ru/"
 
@@ -42,6 +37,7 @@ GROUP_ID = "543"
 INSTITUTE = "ИСИ"
 COURSE = "1"
 GROUP_NAME = "1Б08 №12"
+
 
 bot = Bot(TOKEN)
 
@@ -55,7 +51,6 @@ dp = Dispatcher(
 # ============================================================
 
 class States(StatesGroup):
-
     subject = State()
 
     schedule_subject = State()
@@ -76,13 +71,8 @@ def now():
 # ============================================================
 
 def db():
-
-    connection = sqlite3.connect(
-        DB_PATH
-    )
-
+    connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
-
     return connection
 
 
@@ -271,31 +261,30 @@ async def start(message: Message):
 
     await message.answer(
         "👋 Привет!\n\n"
-
         "Я бот для учёта посещаемости группы.\n\n"
 
         "👑 СТАРОСТА\n"
-        "/set_starosta — назначить себя старостой\n\n"
+        "set староста — назначить себя старостой\n\n"
 
         "📝 ПЕРЕКЛИЧКА\n"
-        "/rollcall — начать перекличку\n"
-        "/attendance — результаты\n"
-        "/finish — завершить перекличку\n\n"
+        "начать перекличку — начать\n"
+        "результаты — результаты\n"
+        "финиш — завершить\n\n"
 
         "📅 РАСПИСАНИЕ\n"
-        "/schedule — расписание\n"
-        "/today — пары сегодня\n"
-        "/refresh_schedule — обновить расписание\n\n"
+        "расписание — показать расписание\n"
+        "сегодня — пары сегодня\n"
+        "обновить расписание — загрузить с сайта\n\n"
 
         "➕ СВОИ ПАРЫ\n"
-        "/add_lesson — добавить пару\n"
-        "/delete_lesson — удалить пару\n"
-        "/my_schedule — сохранённые пары\n\n"
+        "добавить пару — добавить\n"
+        "удалить пару — удалить\n"
+        "мое расписание — сохранённые пары\n\n"
 
         "📊 БАЗА\n"
-        "/students — список студентов\n"
-        "/history — история перекличек\n"
-        "/stats — статистика"
+        "студенты — список студентов\n"
+        "история — история перекличек\n"
+        "статистика — статистика"
     )
 
 
@@ -353,7 +342,7 @@ async def set_starosta(message: Message):
 
 
 # ============================================================
-# НАЧАЛО ПЕРЕКЛИЧКИ
+# ПЕРЕКЛИЧКА
 # ============================================================
 
 @dp.message(Command("rollcall"))
@@ -395,7 +384,6 @@ async def rollcall_subject(
     if not is_starosta(message):
 
         await state.clear()
-
         return
 
     subject = (
@@ -450,7 +438,7 @@ async def rollcall_subject(
 
 
 # ============================================================
-# ОТМЕТКА
+# ОТМЕТКА СТУДЕНТА
 # ============================================================
 
 @dp.callback_query(
@@ -460,16 +448,96 @@ async def attendance_callback(
     callback: CallbackQuery
 ):
 
-    message = callback.message
+    # ВАЖНО:
+    # Пользователя берём именно из callback.from_user.
+    # callback.message может быть InaccessibleMessage,
+    # поэтому нельзя использовать message.from_user.
 
     user = callback.from_user
+    message = callback.message
 
-    if not message:
+    if message is None:
+
+        await callback.answer(
+            "❌ Сообщение недоступно.",
+            show_alert=True
+        )
+
         return
 
-    ensure(message)
+    chat = getattr(
+        message,
+        "chat",
+        None
+    )
+
+    if chat is None:
+
+        await callback.answer(
+            "❌ Не удалось определить чат.",
+            show_alert=True
+        )
+
+        return
+
+    chat_id = chat.id
+
+    chat_title = getattr(
+        chat,
+        "title",
+        None
+    ) or "Чат"
+
+    # --------------------------------------------------------
+    # Регистрируем пользователя напрямую
+    # --------------------------------------------------------
 
     with db() as c:
+
+        c.execute("""
+            INSERT INTO chats(
+                chat_id,
+                title
+            )
+            VALUES(?, ?)
+
+            ON CONFLICT(chat_id)
+            DO UPDATE SET
+                title=excluded.title
+        """, (
+            chat_id,
+            chat_title
+        ))
+
+        c.execute("""
+            INSERT INTO students(
+                chat_id,
+                user_id,
+                name,
+                username,
+                first_seen
+            )
+            VALUES(?, ?, ?, ?, ?)
+
+            ON CONFLICT(
+                chat_id,
+                user_id
+            )
+
+            DO UPDATE SET
+                name=excluded.name,
+                username=excluded.username
+        """, (
+            chat_id,
+            user.id,
+            user.full_name,
+            user.username,
+            now().isoformat()
+        ))
+
+        # ----------------------------------------------------
+        # Ищем активную перекличку
+        # ----------------------------------------------------
 
         rollcall = c.execute("""
             SELECT *
@@ -479,9 +547,10 @@ async def attendance_callback(
               AND status='active'
 
             ORDER BY id DESC
+
             LIMIT 1
         """, (
-            message.chat.id,
+            chat_id,
         )).fetchone()
 
         if not rollcall:
@@ -498,6 +567,10 @@ async def attendance_callback(
             if callback.data == "will"
             else "absent"
         )
+
+        # ----------------------------------------------------
+        # Сохраняем ответ
+        # ----------------------------------------------------
 
         c.execute("""
             INSERT INTO attendance(
@@ -557,6 +630,7 @@ async def attendance(message: Message):
             WHERE chat_id=?
 
             ORDER BY id DESC
+
             LIMIT 1
         """, (
             message.chat.id,
@@ -650,6 +724,7 @@ async def finish(message: Message):
               AND status='active'
 
             ORDER BY id DESC
+
             LIMIT 1
         """, (
             message.chat.id,
@@ -712,54 +787,26 @@ async def finish(message: Message):
 
 async def fetch_schedule_from_site():
 
-    """
-    Получаем расписание для группы 543.
-
-    ВАЖНО:
-    дата НЕ берётся как просто сегодняшняя дата.
-
-    Бот автоматически рассчитывает:
-
-    date_start:
-        понедельник текущей недели
-
-    date_end:
-        воскресенье следующей недели
-
-    Поэтому код работает независимо
-    от текущего числа месяца.
-    """
-
     today = now().date()
 
-    # --------------------------------------------------------
-    # ПОНЕДЕЛЬНИК ТЕКУЩЕЙ НЕДЕЛИ
-    # --------------------------------------------------------
-
+    # Понедельник текущей недели
     date_start_obj = (
-        today
-        - timedelta(days=today.weekday())
+        today -
+        timedelta(days=today.weekday())
     )
 
-    # --------------------------------------------------------
-    # ВОСКРЕСЕНЬЕ СЛЕДУЮЩЕЙ НЕДЕЛИ
-    # --------------------------------------------------------
-
+    # Воскресенье следующей недели
     date_end_obj = (
-        date_start_obj
-        + timedelta(days=13)
+        date_start_obj +
+        timedelta(days=13)
     )
 
-    date_start = (
-        date_start_obj.strftime(
-            "%Y-%m-%d"
-        )
+    date_start = date_start_obj.strftime(
+        "%Y-%m-%d"
     )
 
-    date_end = (
-        date_end_obj.strftime(
-            "%Y-%m-%d"
-        )
+    date_end = date_end_obj.strftime(
+        "%Y-%m-%d"
     )
 
     payload = {
@@ -778,19 +825,14 @@ async def fetch_schedule_from_site():
             "Chrome/140.0.0.0 "
             "Safari/537.36"
         ),
-
         "Referer": SCHEDULE_URL,
-
         "Accept": (
             "text/html,"
             "application/xhtml+xml,"
             "application/xml;q=0.9,"
             "*/*;q=0.8"
         ),
-
-        "Accept-Language": (
-            "ru-RU,ru;q=0.9"
-        )
+        "Accept-Language": "ru-RU,ru;q=0.9"
     }
 
     timeout = aiohttp.ClientTimeout(
@@ -798,29 +840,12 @@ async def fetch_schedule_from_site():
         connect=30
     )
 
-    print(
-        "===================================="
-    )
-
-    print(
-        "ЗАПРОС РАСПИСАНИЯ"
-    )
-
-    print(
-        f"Группа: {GROUP_ID}"
-    )
-
-    print(
-        f"Начало: {date_start}"
-    )
-
-    print(
-        f"Конец: {date_end}"
-    )
-
-    print(
-        "===================================="
-    )
+    print("====================================")
+    print("ЗАПРОС РАСПИСАНИЯ")
+    print(f"Группа: {GROUP_ID}")
+    print(f"Начало: {date_start}")
+    print(f"Конец: {date_end}")
+    print("====================================")
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -850,9 +875,7 @@ async def fetch_schedule_from_site():
                 "ПЕРВЫЕ 500 СИМВОЛОВ:"
             )
 
-            print(
-                html[:500]
-            )
+            print(html[:500])
 
             return html
 
@@ -869,20 +892,15 @@ def clean_text(text):
     return re.sub(
         r"\s+",
         " ",
-        text.replace(
-            "\xa0",
-            " "
-        )
+        text.replace("\xa0", " ")
     ).strip()
 
 
 # ============================================================
-# ДНИ НЕДЕЛИ
+# ДЕНЬ НЕДЕЛИ
 # ============================================================
 
-def russian_day_name(
-    date_string
-):
+def russian_day_name(date_string):
 
     try:
 
@@ -912,7 +930,7 @@ def russian_day_name(
 
 
 # ============================================================
-# ПОИСК ДАТ
+# ДАТЫ
 # ============================================================
 
 def extract_dates(soup):
@@ -932,7 +950,6 @@ def extract_dates(soup):
         re.compile(
             r"\b\d{4}-\d{2}-\d{2}\b"
         )
-
     ]
 
     for text in soup.stripped_strings:
@@ -941,11 +958,7 @@ def extract_dates(soup):
 
         for pattern in patterns:
 
-            matches = pattern.findall(
-                text
-            )
-
-            for value in matches:
+            for value in pattern.findall(text):
 
                 if value not in dates:
                     dates.append(value)
@@ -984,13 +997,10 @@ def extract_dates(soup):
                 )
 
             result.append(
-                dt.strftime(
-                    "%Y-%m-%d"
-                )
+                dt.strftime("%Y-%m-%d")
             )
 
         except ValueError:
-
             pass
 
     return result
@@ -1007,9 +1017,7 @@ def parse_schedule_html(html):
         "html.parser"
     )
 
-    dates = extract_dates(
-        soup
-    )
+    dates = extract_dates(soup)
 
     time_pattern = re.compile(
         r"\b"
@@ -1025,13 +1033,9 @@ def parse_schedule_html(html):
         string=time_pattern
     ):
 
-        raw = clean_text(
-            element
-        )
+        raw = clean_text(element)
 
-        match = time_pattern.search(
-            raw
-        )
+        match = time_pattern.search(raw)
 
         if not match:
             continue
@@ -1057,7 +1061,6 @@ def parse_schedule_html(html):
                 len(text) >= 20
                 and len(text) <= 2000
             ):
-
                 break
 
             container = container.parent
@@ -1072,31 +1075,17 @@ def parse_schedule_html(html):
             )
         )
 
-        remaining = time_pattern.sub(
-            "",
-            full_text
-        ).strip()
-
-        if len(remaining) < 3:
-            continue
-
-        # ----------------------------------------------------
-        # ПРЕДМЕТ
-        # ----------------------------------------------------
-
         subject = ""
 
-        important = container.find_all(
-            [
-                "b",
-                "strong",
-                "h1",
-                "h2",
-                "h3",
-                "h4",
-                "h5"
-            ]
-        )
+        important = container.find_all([
+            "b",
+            "strong",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5"
+        ])
 
         for item in important:
 
@@ -1117,7 +1106,6 @@ def parse_schedule_html(html):
                 continue
 
             subject = value
-
             break
 
         if not subject:
@@ -1142,13 +1130,11 @@ def parse_schedule_html(html):
                     "лабораторное занятие",
                     "семинар"
                 }:
-
                     continue
 
                 if len(part) >= 3:
 
                     subject = part
-
                     break
 
         if not subject:
@@ -1184,7 +1170,6 @@ def parse_schedule_html(html):
             ):
 
                 teacher = part
-
                 break
 
         # ----------------------------------------------------
@@ -1200,7 +1185,6 @@ def parse_schedule_html(html):
             r"ауд\.\s*[\wА-Яа-яЁё./-]+",
 
             r"аудитория\s*[\wА-Яа-яЁё./-]+"
-
         ]
 
         for pattern in classroom_patterns:
@@ -1278,11 +1262,10 @@ def parse_schedule_html(html):
 
             "subgroup":
                 subgroup
-
         })
 
     # --------------------------------------------------------
-    # УДАЛЯЕМ ДУБЛИКАТЫ
+    # УДАЛЕНИЕ ДУБЛИКАТОВ
     # --------------------------------------------------------
 
     unique = []
@@ -1304,9 +1287,7 @@ def parse_schedule_html(html):
 
         seen.add(key)
 
-        unique.append(
-            lesson
-        )
+        unique.append(lesson)
 
     result = []
 
@@ -1316,42 +1297,30 @@ def parse_schedule_html(html):
 
     if dates:
 
-        for index, lesson in enumerate(
-            unique
-        ):
+        for index, lesson in enumerate(unique):
 
-            item = dict(
-                lesson
-            )
+            item = dict(lesson)
 
             item["date"] = dates[
                 index % len(dates)
             ]
 
-            item["day_name"] = (
-                russian_day_name(
-                    item["date"]
-                )
+            item["day_name"] = russian_day_name(
+                item["date"]
             )
 
-            result.append(
-                item
-            )
+            result.append(item)
 
     else:
 
         for lesson in unique:
 
-            item = dict(
-                lesson
-            )
+            item = dict(lesson)
 
             item["date"] = ""
             item["day_name"] = ""
 
-            result.append(
-                item
-            )
+            result.append(item)
 
     return result
 
@@ -1410,15 +1379,10 @@ def save_remote_schedule(
                 DO UPDATE SET
 
                     day_name=excluded.day_name,
-
                     teacher=excluded.teacher,
-
                     classroom=excluded.classroom,
-
                     lesson_type=excluded.lesson_type,
-
                     source=excluded.source,
-
                     updated_at=excluded.updated_at
 
             """, (
@@ -1465,7 +1429,6 @@ def save_remote_schedule(
                 SCHEDULE_URL,
 
                 now().isoformat()
-
             ))
 
             saved += 1
@@ -1477,9 +1440,7 @@ def save_remote_schedule(
 # ОБНОВЛЕНИЕ РАСПИСАНИЯ
 # ============================================================
 
-async def update_schedule(
-    chat_id
-):
+async def update_schedule(chat_id):
 
     html = await fetch_schedule_from_site()
 
@@ -1489,9 +1450,7 @@ async def update_schedule(
             "Сайт вернул пустой ответ"
         )
 
-    lessons = parse_schedule_html(
-        html
-    )
+    lessons = parse_schedule_html(html)
 
     if not lessons:
 
@@ -1506,12 +1465,10 @@ async def update_schedule(
 
 
 # ============================================================
-# КОМАНДА ОБНОВИТЬ РАСПИСАНИЕ
+# ОБНОВИТЬ РАСПИСАНИЕ
 # ============================================================
 
-@dp.message(
-    Command("refresh_schedule")
-)
+@dp.message(Command("refresh_schedule"))
 async def refresh_schedule(
     message: Message
 ):
@@ -1519,126 +1476,75 @@ async def refresh_schedule(
     ensure(message)
 
     await message.answer(
-        "🔄 Загружаю расписание "
-        "с сайта ВоГУ...\n\n"
-
+        "🔄 Загружаю расписание с сайта...\n\n"
         f"🏫 Институт: {INSTITUTE}\n"
         f"🎓 Курс: {COURSE}\n"
         f"👥 Группа: {GROUP_NAME}\n"
-        f"🆔 ID группы: {GROUP_ID}"
+        f"🆔 ID: {GROUP_ID}"
     )
 
     try:
 
-        saved, response_size = (
-            await update_schedule(
-                message.chat.id
-            )
+        saved, response_size = await update_schedule(
+            message.chat.id
         )
 
         if saved == 0:
 
             await message.answer(
-                "⚠️ Сайт ответил, "
-                "но бот не смог "
+                "⚠️ Сайт ответил, но бот не смог "
                 "распознать расписание.\n\n"
-
-                f"📦 Размер ответа сайта: "
-                f"{response_size} символов\n\n"
-
-                "Нужно будет посмотреть "
-                "структуру ответа сайта."
+                f"Размер ответа сайта: "
+                f"{response_size} символов."
             )
 
             return
 
         await message.answer(
             "✅ РАСПИСАНИЕ ОБНОВЛЕНО!\n\n"
-
-            f"🏫 {INSTITUTE}\n"
-            f"🎓 {COURSE} курс\n"
-            f"👥 {GROUP_NAME}\n"
-            f"🆔 ID группы: {GROUP_ID}\n\n"
-
             f"📚 Сохранено занятий: {saved}\n\n"
-
-            "Теперь можно написать:\n"
-            "🗓 расписание\n"
-            "📌 сегодня"
+            "Теперь напиши:\n"
+            "расписание\n"
+            "или\n"
+            "сегодня"
         )
 
     except aiohttp.ClientResponseError as e:
 
         await message.answer(
             "❌ Сайт отклонил запрос.\n\n"
-
             f"HTTP-код: {e.status}\n"
-            f"Причина: "
-            f"{e.message or 'не указана'}"
-        )
-
-        print(
-            "ОШИБКА HTTP:",
-            e.status,
-            e.message
+            f"{e.message or ''}"
         )
 
     except asyncio.TimeoutError:
 
         await message.answer(
             "❌ Сайт не ответил вовремя.\n\n"
-
             "Сервер расписания слишком долго "
             "отвечает на запрос."
-        )
-
-        print(
-            "ОШИБКА: тайм-аут"
         )
 
     except aiohttp.ClientError as e:
 
         await message.answer(
             "❌ Ошибка соединения с сайтом.\n\n"
-
-            f"Тип: {type(e).__name__}\n"
-            f"Текст: {str(e) or 'пусто'}"
-        )
-
-        print(
-            "ОШИБКА СОЕДИНЕНИЯ:",
-            type(e).__name__,
-            repr(e)
+            f"{type(e).__name__}: {str(e)}"
         )
 
     except Exception as e:
 
         await message.answer(
-            "❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ "
-            "РАСПИСАНИЕ С САЙТА.\n\n"
-
-            f"Тип ошибки: "
-            f"{type(e).__name__}\n"
-
-            f"Текст ошибки: "
-            f"{str(e) or 'пусто'}"
-        )
-
-        print(
-            "ОШИБКА РАСПИСАНИЯ:",
-            type(e).__name__,
-            repr(e)
+            "❌ Не удалось получить расписание.\n\n"
+            f"{type(e).__name__}: {str(e)}"
         )
 
 
 # ============================================================
-# ФОРМАТИРОВАНИЕ РАСПИСАНИЯ
+# ФОРМАТ РАСПИСАНИЯ
 # ============================================================
 
-def format_schedule(
-    rows,
-    title
-):
+def format_schedule(rows, title):
 
     if not rows:
 
@@ -1649,7 +1555,6 @@ def format_schedule(
 
     text = (
         f"{title}\n\n"
-
         f"🏫 {INSTITUTE}\n"
         f"🎓 {COURSE} курс\n"
         f"👥 {GROUP_NAME}\n"
@@ -1659,9 +1564,7 @@ def format_schedule(
 
     for row in rows:
 
-        lesson_date = row[
-            "lesson_date"
-        ]
+        lesson_date = row["lesson_date"]
 
         if lesson_date != current_date:
 
@@ -1712,8 +1615,7 @@ def format_schedule(
         if row["subgroup"]:
 
             text += (
-                f"👥 "
-                f"{row['subgroup']} подгруппа\n"
+                f"👥 {row['subgroup']} подгруппа\n"
             )
 
     return text
@@ -1723,12 +1625,8 @@ def format_schedule(
 # РАСПИСАНИЕ
 # ============================================================
 
-@dp.message(
-    Command("schedule")
-)
-async def schedule(
-    message: Message
-):
+@dp.message(Command("schedule"))
+async def schedule(message: Message):
 
     ensure(message)
 
@@ -1737,7 +1635,6 @@ async def schedule(
         count = c.execute("""
             SELECT COUNT(*)
             FROM remote_schedule
-
             WHERE chat_id=?
         """, (
             message.chat.id,
@@ -1747,26 +1644,21 @@ async def schedule(
 
         await message.answer(
             "🔄 Расписание ещё не загружено.\n\n"
-            "Получаю его с сайта ВоГУ..."
+            "Получаю его с сайта..."
         )
 
         try:
 
-            saved, response_size = (
-                await update_schedule(
-                    message.chat.id
-                )
+            saved, response_size = await update_schedule(
+                message.chat.id
             )
 
             if saved == 0:
 
                 await message.answer(
-                    "⚠️ Бот получил ответ "
-                    "от сайта, но не смог "
-                    "распознать расписание.\n\n"
-
-                    f"Размер ответа: "
-                    f"{response_size} символов."
+                    "⚠️ Бот получил ответ от сайта, "
+                    "но не смог распознать расписание.\n\n"
+                    f"Размер ответа: {response_size} символов."
                 )
 
                 return
@@ -1774,11 +1666,8 @@ async def schedule(
         except Exception as e:
 
             await message.answer(
-                "❌ Не удалось загрузить "
-                "расписание.\n\n"
-
-                f"{type(e).__name__}: "
-                f"{str(e) or 'пусто'}"
+                "❌ Не удалось загрузить расписание.\n\n"
+                f"{type(e).__name__}: {str(e)}"
             )
 
             return
@@ -1800,10 +1689,7 @@ async def schedule(
 
     today = now().date()
 
-    limit_date = (
-        today
-        + timedelta(days=14)
-    )
+    limit_date = today + timedelta(days=14)
 
     filtered = []
 
@@ -1816,16 +1702,11 @@ async def schedule(
                 "%Y-%m-%d"
             ).date()
 
-            if (
-                today
-                <= lesson_date
-                <= limit_date
-            ):
+            if today <= lesson_date <= limit_date:
 
                 filtered.append(row)
 
         except Exception:
-
             pass
 
     await message.answer(
@@ -1840,9 +1721,7 @@ async def schedule(
 # СЕГОДНЯ
 # ============================================================
 
-@dp.message(
-    Command("today")
-)
+@dp.message(Command("today"))
 async def today_schedule(
     message: Message
 ):
@@ -1877,7 +1756,6 @@ async def today_schedule(
             )
 
         except Exception:
-
             pass
 
         with db() as c:
@@ -1907,9 +1785,7 @@ async def today_schedule(
 # ДОБАВИТЬ ПАРУ
 # ============================================================
 
-@dp.message(
-    Command("add_lesson")
-)
+@dp.message(Command("add_lesson"))
 async def add_lesson(
     message: Message,
     state: FSMContext
@@ -1935,9 +1811,7 @@ async def add_lesson(
     )
 
 
-@dp.message(
-    States.schedule_subject
-)
+@dp.message(States.schedule_subject)
 async def add_lesson_subject(
     message: Message,
     state: FSMContext
@@ -1954,8 +1828,7 @@ async def add_lesson_subject(
     )
 
     await message.answer(
-        "📅 Введи день недели числом:\n\n"
-
+        "📅 Введи день недели:\n\n"
         "1 — Понедельник\n"
         "2 — Вторник\n"
         "3 — Среда\n"
@@ -1966,9 +1839,7 @@ async def add_lesson_subject(
     )
 
 
-@dp.message(
-    States.schedule_day
-)
+@dp.message(States.schedule_day)
 async def add_lesson_day(
     message: Message,
     state: FSMContext
@@ -2004,9 +1875,7 @@ async def add_lesson_day(
     )
 
 
-@dp.message(
-    States.schedule_time
-)
+@dp.message(States.schedule_time)
 async def add_lesson_time(
     message: Message,
     state: FSMContext
@@ -2052,7 +1921,6 @@ async def add_lesson_time(
 
     await message.answer(
         "✅ ПАРА ДОБАВЛЕНА!\n\n"
-
         f"📚 {data['subject']}\n"
         f"🕐 {value}"
     )
@@ -2062,9 +1930,7 @@ async def add_lesson_time(
 # УДАЛИТЬ ПАРУ
 # ============================================================
 
-@dp.message(
-    Command("delete_lesson")
-)
+@dp.message(Command("delete_lesson"))
 async def delete_lesson(
     message: Message
 ):
@@ -2101,9 +1967,7 @@ async def delete_lesson(
 
         return
 
-    text = (
-        "🗑 СОХРАНЁННЫЕ ПАРЫ\n\n"
-    )
+    text = "🗑 СОХРАНЁННЫЕ ПАРЫ\n\n"
 
     for row in rows:
 
@@ -2116,7 +1980,6 @@ async def delete_lesson(
     text += (
         "Чтобы удалить пару:\n"
         "/delete_1\n\n"
-
         "Например:\n"
         "/delete_5"
     )
@@ -2181,7 +2044,6 @@ async def delete_lesson_by_id(
 
     await message.answer(
         "🗑 ПАРА УДАЛЕНА!\n\n"
-
         f"📚 {row['subject']}\n"
         f"🕐 {row['lesson_time']}"
     )
@@ -2191,9 +2053,7 @@ async def delete_lesson_by_id(
 # МОЁ РАСПИСАНИЕ
 # ============================================================
 
-@dp.message(
-    Command("my_schedule")
-)
+@dp.message(Command("my_schedule"))
 async def my_schedule(
     message: Message
 ):
@@ -2231,9 +2091,7 @@ async def my_schedule(
         7: "Воскресенье"
     }
 
-    text = (
-        "📅 СОХРАНЁННЫЕ ПАРЫ\n\n"
-    )
+    text = "📅 СОХРАНЁННЫЕ ПАРЫ\n\n"
 
     current_day = None
 
@@ -2260,9 +2118,7 @@ async def my_schedule(
 # СТУДЕНТЫ
 # ============================================================
 
-@dp.message(
-    Command("students")
-)
+@dp.message(Command("students"))
 async def students(
     message: Message
 ):
@@ -2305,10 +2161,7 @@ async def students(
         f"Всего: {len(rows)}\n\n"
     )
 
-    for index, row in enumerate(
-        rows,
-        1
-    ):
+    for index, row in enumerate(rows, 1):
 
         username = (
             f" @{row['username']}"
@@ -2329,9 +2182,7 @@ async def students(
 # ИСТОРИЯ
 # ============================================================
 
-@dp.message(
-    Command("history")
-)
+@dp.message(Command("history"))
 async def history(
     message: Message
 ):
@@ -2370,9 +2221,7 @@ async def history(
 
         return
 
-    text = (
-        "📚 ИСТОРИЯ ПЕРЕКЛИЧЕК\n\n"
-    )
+    text = "📚 ИСТОРИЯ ПЕРЕКЛИЧЕК\n\n"
 
     for row in rows:
 
@@ -2404,15 +2253,8 @@ async def history(
                 row["id"],
             )).fetchone()
 
-        present = (
-            stats["present"]
-            or 0
-        )
-
-        absent = (
-            stats["absent"]
-            or 0
-        )
+        present = stats["present"] or 0
+        absent = stats["absent"] or 0
 
         text += (
             f"📅 {row['started_at']}\n"
@@ -2429,9 +2271,7 @@ async def history(
 # СТАТИСТИКА
 # ============================================================
 
-@dp.message(
-    Command("stats")
-)
+@dp.message(Command("stats"))
 async def stats(
     message: Message
 ):
@@ -2504,7 +2344,6 @@ async def stats(
 
     await message.answer(
         "📊 СТАТИСТИКА\n\n"
-
         f"👥 Студентов: {students_count}\n"
         f"📝 Перекличек: {rollcalls}\n"
         f"📌 Всего отметок: {total}\n"
@@ -2535,27 +2374,21 @@ async def text_today(
     message: Message
 ):
 
-    await today_schedule(
-        message
-    )
+    await today_schedule(message)
 
 
 @dp.message(
-    F.text.casefold()
-    == "обновить расписание"
+    F.text.casefold() == "обновить расписание"
 )
 async def text_refresh(
     message: Message
 ):
 
-    await refresh_schedule(
-        message
-    )
+    await refresh_schedule(message)
 
 
 @dp.message(
-    F.text.casefold()
-    == "начать перекличку"
+    F.text.casefold() == "начать перекличку"
 )
 async def text_rollcall(
     message: Message,
@@ -2569,8 +2402,7 @@ async def text_rollcall(
 
 
 @dp.message(
-    F.text.casefold()
-    == "результаты"
+    F.text.casefold() == "результаты"
 )
 async def text_attendance(
     message: Message
@@ -2580,8 +2412,7 @@ async def text_attendance(
 
 
 @dp.message(
-    F.text.casefold()
-    == "финиш"
+    F.text.casefold() == "финиш"
 )
 async def text_finish(
     message: Message
@@ -2591,21 +2422,17 @@ async def text_finish(
 
 
 @dp.message(
-    F.text.casefold()
-    == "сет староста"
+    F.text.casefold() == "сет староста"
 )
 async def text_starosta(
     message: Message
 ):
 
-    await set_starosta(
-        message
-    )
+    await set_starosta(message)
 
 
 @dp.message(
-    F.text.casefold()
-    == "студенты"
+    F.text.casefold() == "студенты"
 )
 async def text_students(
     message: Message
@@ -2615,8 +2442,7 @@ async def text_students(
 
 
 @dp.message(
-    F.text.casefold()
-    == "история"
+    F.text.casefold() == "история"
 )
 async def text_history(
     message: Message
@@ -2626,14 +2452,47 @@ async def text_history(
 
 
 @dp.message(
-    F.text.casefold()
-    == "статистика"
+    F.text.casefold() == "статистика"
 )
 async def text_stats(
     message: Message
 ):
 
     await stats(message)
+
+
+@dp.message(
+    F.text.casefold() == "добавить пару"
+)
+async def text_add_lesson(
+    message: Message,
+    state: FSMContext
+):
+
+    await add_lesson(
+        message,
+        state
+    )
+
+
+@dp.message(
+    F.text.casefold() == "удалить пару"
+)
+async def text_delete_lesson(
+    message: Message
+):
+
+    await delete_lesson(message)
+
+
+@dp.message(
+    F.text.casefold() == "мое расписание"
+)
+async def text_my_schedule(
+    message: Message
+):
+
+    await my_schedule(message)
 
 
 # ============================================================
@@ -2672,13 +2531,9 @@ async def main():
         "===================================="
     )
 
-    await dp.start_polling(
-        bot
-    )
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
 
-    asyncio.run(
-        main()
-    )
+    asyncio.run(main())
