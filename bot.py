@@ -1,1510 +1,2189 @@
 import os
-import csv
-import io
-import asyncio
 import sqlite3
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import asyncio
+from datetime import datetime, date
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BufferedInputFile
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 
-# =========================
+# ============================================================
 # НАСТРОЙКИ
-# =========================
+# ============================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан")
-
-TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
-DB_PATH = os.getenv("DB_PATH", "attendance.db")
-
-bot = Bot(TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в Variables Railway")
 
 
-# =========================
-# СОСТОЯНИЯ
-# =========================
+# Если укажешь свой Telegram ID здесь через Railway Variables,
+# только ты сможешь назначать/снимать старосту.
+#
+# Например:
+# OWNER_ID = 123456789
+#
+# Если переменная не задана — первый пользователь сможет
+# нажать "Стать старостой".
+OWNER_ID = os.getenv("OWNER_ID")
 
-class States(StatesGroup):
-    subject = State()
-
-    schedule_subject = State()
-    schedule_day = State()
-    schedule_time = State()
+if OWNER_ID:
+    OWNER_ID = int(OWNER_ID)
 
 
-# =========================
+DB_FILE = "attendance.db"
+
+
+# ============================================================
 # БАЗА ДАННЫХ
-# =========================
+# ============================================================
 
-def db():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def now():
-    return datetime.now(TZ)
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
 
 
 def init_db():
+    cursor = db.cursor()
 
-    with db() as c:
-
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS chats(
-            chat_id INTEGER PRIMARY KEY,
-            title TEXT,
-            starosta_id INTEGER,
-            starosta_name TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS students(
-            chat_id INTEGER,
-            user_id INTEGER,
-            name TEXT,
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
             username TEXT,
-            first_seen TEXT,
-            PRIMARY KEY(chat_id, user_id)
-        );
+            full_name TEXT,
+            subgroup INTEGER,
+            created_at TEXT
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS rollcalls(
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            subject TEXT,
-            started_at TEXT,
-            finished_at TEXT,
-            status TEXT DEFAULT 'active'
-        );
+            telegram_id INTEGER NOT NULL,
+            lesson_id INTEGER NOT NULL,
+            lesson_date TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            marked_at TEXT NOT NULL,
+            UNIQUE(telegram_id, lesson_id, lesson_date)
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS attendance(
-            rollcall_id INTEGER,
-            user_id INTEGER,
-            name TEXT,
-            status TEXT,
-            answered_at TEXT,
-            PRIMARY KEY(rollcall_id, user_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS schedule(
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lessons (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            subject TEXT,
-            day INTEGER,
-            lesson_time TEXT,
-            reminder INTEGER DEFAULT 30,
-            enabled INTEGER DEFAULT 1
-        );
-        """)
+            lesson_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            teacher TEXT,
+            room TEXT,
+            lesson_type TEXT,
+            subgroup INTEGER,
+            created_by INTEGER,
+            is_custom INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    db.commit()
 
 
-# =========================
-# РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
-# =========================
-
-def ensure(message: Message):
-
-    with db() as c:
-
-        c.execute("""
-        INSERT INTO chats(chat_id, title)
-        VALUES(?, ?)
-
-        ON CONFLICT(chat_id)
-        DO UPDATE SET title=excluded.title
-        """,
-        (
-            message.chat.id,
-            message.chat.title or "Личный чат"
-        ))
-
-        if message.from_user:
-
-            c.execute("""
-            INSERT INTO students(
-                chat_id,
-                user_id,
-                name,
-                username,
-                first_seen
-            )
-            VALUES(?, ?, ?, ?, ?)
-
-            ON CONFLICT(chat_id, user_id)
-            DO UPDATE SET
-                name=excluded.name,
-                username=excluded.username
-            """,
-            (
-                message.chat.id,
-                message.from_user.id,
-                message.from_user.full_name,
-                message.from_user.username,
-                now().isoformat()
-            ))
+init_db()
 
 
-# =========================
-# ПРОВЕРКА СТАРОСТЫ
-# =========================
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
 
-def is_admin(message):
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with db() as c:
 
-        row = c.execute("""
-        SELECT starosta_id
-        FROM chats
-        WHERE chat_id=?
-        """,
-        (message.chat.id,)).fetchone()
+def today_str():
+    return date.today().strftime("%Y-%m-%d")
+
+
+def save_user(message: Message):
+    user = message.from_user
+
+    full_name = user.full_name or ""
+    username = user.username or ""
+
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO users (
+            telegram_id,
+            username,
+            full_name,
+            subgroup,
+            created_at
+        )
+        VALUES (?, ?, ?, NULL, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username=excluded.username,
+            full_name=excluded.full_name
+    """, (
+        user.id,
+        username,
+        full_name,
+        now_str()
+    ))
+
+    db.commit()
+
+
+def get_user_subgroup(user_id: int) -> Optional[int]:
+    cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT subgroup FROM users WHERE telegram_id = ?",
+        (user_id,)
+    )
+
+    row = cursor.fetchone()
 
     if not row:
-        return False
+        return None
 
-    return row["starosta_id"] == message.from_user.id
-
-
-async def admin_only(message):
-
-    if not is_admin(message):
-
-        await message.answer(
-            "❌ Эта команда доступна только старосте."
-        )
-
-        return False
-
-    return True
+    return row["subgroup"]
 
 
-# =========================
-# ТЕКУЩАЯ ПЕРЕКЛИЧКА
-# =========================
+def set_user_subgroup(user_id: int, subgroup: int):
+    cursor = db.cursor()
 
-def active(chat_id):
+    cursor.execute("""
+        UPDATE users
+        SET subgroup = ?
+        WHERE telegram_id = ?
+    """, (
+        subgroup,
+        user_id
+    ))
 
-    with db() as c:
-
-        return c.execute("""
-        SELECT *
-        FROM rollcalls
-        WHERE chat_id=?
-        AND status='active'
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (chat_id,)).fetchone()
+    db.commit()
 
 
-# =========================
-# КНОПКИ ПЕРЕКЛИЧКИ
-# =========================
+def get_starosta_id() -> Optional[int]:
+    cursor = db.cursor()
 
-def attendance_buttons():
+    cursor.execute(
+        "SELECT value FROM settings WHERE key = 'starosta_id'"
+    )
 
+    row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    try:
+        return int(row["value"])
+    except Exception:
+        return None
+
+
+def set_starosta_id(user_id: int):
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO settings(key, value)
+        VALUES('starosta_id', ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+    """, (str(user_id),))
+
+    db.commit()
+
+
+def remove_starosta():
+    cursor = db.cursor()
+
+    cursor.execute(
+        "DELETE FROM settings WHERE key = 'starosta_id'"
+    )
+
+    db.commit()
+
+
+def is_starosta(user_id: int) -> bool:
+    starosta = get_starosta_id()
+
+    return starosta is not None and starosta == user_id
+
+
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID is not None and OWNER_ID == user_id
+
+
+# ============================================================
+# РАСПИСАНИЕ
+# ============================================================
+
+# Формат:
+#
+# (
+#   дата,
+#   начало,
+#   конец,
+#   предмет,
+#   преподаватель,
+#   аудитория,
+#   тип,
+#   подгруппа
+# )
+#
+# Подгруппа:
+# 1 = первая
+# 2 = вторая
+# 0 = общая
+
+
+SCHEDULE = [
+
+    # ========================================================
+    # 07.09.2026 ПОНЕДЕЛЬНИК
+    # ========================================================
+
+    (
+        "2026-09-07",
+        "15:20",
+        "16:50",
+        "Инженерная геология",
+        "Чернышов Валерий Иванович",
+        "к. 3, ауд. 119",
+        "Лабораторная",
+        1
+    ),
+
+    (
+        "2026-09-07",
+        "17:00",
+        "18:30",
+        "Инженерная геология",
+        "Чернышов Валерий Иванович",
+        "к. 3, ауд. 119",
+        "Лабораторная",
+        1
+    ),
+
+
+    # ========================================================
+    # 08.09.2026 ВТОРНИК
+    # ========================================================
+
+    (
+        "2026-09-08",
+        "08:00",
+        "09:30",
+        "Инженерная геология",
+        "ст.пр. Чернышов Валерий Иванович",
+        "к. 4, ауд. 2а",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-08",
+        "09:40",
+        "11:10",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-08",
+        "11:40",
+        "13:10",
+        "Иностранный язык",
+        "доц. Чубарова Наталья Андреевна",
+        "к. 5, ауд. 322",
+        "Практика",
+        1
+    ),
+
+    (
+        "2026-09-08",
+        "13:20",
+        "14:50",
+        "Иностранный язык",
+        "доц. Чубарова Наталья Андреевна",
+        "к. 5, ауд. 322",
+        "Практика",
+        1
+    ),
+
+
+    # ========================================================
+    # 09.09.2026 СРЕДА
+    # ========================================================
+
+    (
+        "2026-09-09",
+        "11:40",
+        "13:10",
+        "История России",
+        "зав.каф. Саблин Василий Анатольевич",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-09",
+        "13:20",
+        "14:50",
+        "Инженерная графика",
+        "доц. Шашкова Лола Эдуардовна",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 10.09.2026 ЧЕТВЕРГ
+    # ========================================================
+
+    (
+        "2026-09-10",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Королева Ирина Валентиновна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        1
+    ),
+
+    (
+        "2026-09-10",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Соколова Ирина Юрьевна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        2
+    ),
+
+    (
+        "2026-09-10",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Королева Ирина Валентиновна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-10",
+        "13:20",
+        "14:50",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 321",
+        "Практика",
+        0
+    ),
+
+
+    # ========================================================
+    # 11.09.2026 ПЯТНИЦА
+    # ========================================================
+
+    (
+        "2026-09-11",
+        "08:00",
+        "09:30",
+        "Русский язык и деловая коммуникация",
+        "ст.пр. Голубева Анастасия Анатольевна",
+        "к. 1, ауд. 413",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-11",
+        "09:40",
+        "11:10",
+        "История России",
+        "доц. Ильина Ольга Викторовна",
+        "к. 1, ауд. 415",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-11",
+        "11:40",
+        "13:10",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 1, ауд. 413",
+        "Практика",
+        0
+    ),
+
+
+    # ========================================================
+    # 12.09.2026 СУББОТА
+    # ========================================================
+
+    (
+        "2026-09-12",
+        "08:00",
+        "09:30",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-12",
+        "09:40",
+        "11:10",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 14.09.2026 ПОНЕДЕЛЬНИК
+    # ========================================================
+
+    (
+        "2026-09-14",
+        "08:00",
+        "09:30",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 217",
+        "Лабораторная",
+        1
+    ),
+
+    (
+        "2026-09-14",
+        "09:40",
+        "11:10",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 217",
+        "Лабораторная",
+        1
+    ),
+
+    (
+        "2026-09-14",
+        "15:20",
+        "16:50",
+        "Инженерная геология",
+        "ст.пр. Чернышов Валерий Иванович",
+        "к. 3, ауд. 119",
+        "Лабораторная",
+        2
+    ),
+
+    (
+        "2026-09-14",
+        "17:00",
+        "18:30",
+        "Инженерная геология",
+        "ст.пр. Чернышов Валерий Иванович",
+        "к. 3, ауд. 119",
+        "Лабораторная",
+        2
+    ),
+
+
+    # ========================================================
+    # 15.09.2026 ВТОРНИК
+    # ========================================================
+
+    (
+        "2026-09-15",
+        "11:40",
+        "13:10",
+        "Иностранный язык",
+        "доц. Чубарова Наталья Андреевна",
+        "к. 5, ауд. 322",
+        "Практика",
+        2
+    ),
+
+    (
+        "2026-09-15",
+        "13:20",
+        "14:50",
+        "Иностранный язык",
+        "доц. Чубарова Наталья Андреевна",
+        "к. 5, ауд. 322",
+        "Практика",
+        2
+    ),
+
+
+    # ========================================================
+    # 16.09.2026 СРЕДА
+    # ========================================================
+
+    (
+        "2026-09-16",
+        "11:40",
+        "13:10",
+        "История России",
+        "зав.каф. Саблин Василий Анатольевич",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-16",
+        "13:20",
+        "14:50",
+        "Инженерная графика",
+        "доц. Шашкова Лола Эдуардовна",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 17.09.2026 ЧЕТВЕРГ
+    # ========================================================
+
+    (
+        "2026-09-17",
+        "08:00",
+        "09:30",
+        "Высшая математика",
+        "доц. Кочкарева Татьяна Александровна",
+        "к. 1, ауд. 407",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-17",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Королева Ирина Валентиновна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        1
+    ),
+
+    (
+        "2026-09-17",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Соколова Ирина Юрьевна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        2
+    ),
+
+    (
+        "2026-09-17",
+        "11:40",
+        "13:10",
+        "Высшая математика",
+        "доц. Кочкарева Татьяна Александровна",
+        "к. 1, ауд. 401",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 18.09.2026 ПЯТНИЦА
+    # ========================================================
+
+    (
+        "2026-09-18",
+        "08:00",
+        "09:30",
+        "Русский язык и деловая коммуникация",
+        "ст.пр. Голубева Анастасия Анатольевна",
+        "к. 1, ауд. 413",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-18",
+        "09:40",
+        "11:10",
+        "История России",
+        "доц. Ильина Ольга Викторовна",
+        "к. 1, ауд. 415",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-18",
+        "11:40",
+        "13:10",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 1, ауд. 413",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-18",
+        "13:20",
+        "14:50",
+        "Информационные технологии и основы искусственного интеллекта",
+        "доц. Ганиева Елена Михайловна",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 19.09.2026 СУББОТА
+    # ========================================================
+
+    (
+        "2026-09-19",
+        "08:00",
+        "09:30",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-19",
+        "09:40",
+        "11:10",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 21.09.2026 ПОНЕДЕЛЬНИК
+    # ========================================================
+
+    (
+        "2026-09-21",
+        "08:00",
+        "09:30",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 217",
+        "Лабораторная",
+        2
+    ),
+
+    (
+        "2026-09-21",
+        "09:40",
+        "11:10",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 217",
+        "Лабораторная",
+        2
+    ),
+
+    (
+        "2026-09-21",
+        "15:20",
+        "16:50",
+        "Инженерная геология",
+        "ст.пр. Чернышов Валерий Иванович",
+        "к. 3, ауд. 119",
+        "Лабораторная",
+        1
+    ),
+
+    (
+        "2026-09-21",
+        "17:00",
+        "18:30",
+        "Инженерная геология",
+        "ст.пр. Чернышов Валерий Иванович",
+        "к. 3, ауд. 119",
+        "Лабораторная",
+        1
+    ),
+
+
+    # ========================================================
+    # 22.09.2026 ВТОРНИК
+    # ========================================================
+
+    (
+        "2026-09-22",
+        "08:00",
+        "09:30",
+        "Инженерная геология",
+        "ст.пр. Чернышов Валерий Иванович",
+        "к. 4, ауд. 2а",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-22",
+        "09:40",
+        "11:10",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-22",
+        "11:40",
+        "13:10",
+        "Иностранный язык",
+        "доц. Чубарова Наталья Андреевна",
+        "к. 5, ауд. 322",
+        "Практика",
+        1
+    ),
+
+    (
+        "2026-09-22",
+        "13:20",
+        "14:50",
+        "Иностранный язык",
+        "доц. Чубарова Наталья Андреевна",
+        "к. 5, ауд. 322",
+        "Практика",
+        1
+    ),
+
+
+    # ========================================================
+    # 23.09.2026 СРЕДА
+    # ========================================================
+
+    (
+        "2026-09-23",
+        "11:40",
+        "13:10",
+        "История России",
+        "зав.каф. Саблин Василий Анатольевич",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-23",
+        "13:20",
+        "14:50",
+        "Инженерная графика",
+        "доц. Шашкова Лола Эдуардовна",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+
+    # ========================================================
+    # 24.09.2026 ЧЕТВЕРГ
+    # ========================================================
+
+    (
+        "2026-09-24",
+        "08:00",
+        "09:30",
+        "Высшая математика",
+        "доц. Кочкарева Татьяна Александровна",
+        "к. 1, ауд. 407",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-24",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Королева Ирина Валентиновна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        1
+    ),
+
+    (
+        "2026-09-24",
+        "09:40",
+        "11:10",
+        "Физическая культура и спорт",
+        "ст.пр. Соколова Ирина Юрьевна",
+        "к. с/к 1, ауд. спорт. корпус",
+        "Практика",
+        2
+    ),
+
+    (
+        "2026-09-24",
+        "11:40",
+        "13:10",
+        "Высшая математика",
+        "доц. Кочкарева Татьяна Александровна",
+        "к. 1, ауд. 401",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-24",
+        "13:20",
+        "14:50",
+        "Физика",
+        "ст.пр. Соловьёв Александр Сергеевич",
+        "к. 2, ауд. 321",
+        "Практика",
+        0
+    ),
+
+
+    # ========================================================
+    # 25.09.2026 ПЯТНИЦА
+    # ========================================================
+
+    (
+        "2026-09-25",
+        "08:00",
+        "09:30",
+        "Русский язык и деловая коммуникация",
+        "ст.пр. Голубева Анастасия Анатольевна",
+        "к. 1, ауд. 413",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-25",
+        "09:40",
+        "11:10",
+        "История России",
+        "доц. Ильина Ольга Викторовна",
+        "к. 1, ауд. 415",
+        "Практика",
+        0
+    ),
+
+    (
+        "2026-09-25",
+        "11:40",
+        "13:10",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 1, ауд. 413",
+        "Практика",
+        0
+    ),
+
+
+    # ========================================================
+    # 26.09.2026 СУББОТА
+    # ========================================================
+
+    (
+        "2026-09-26",
+        "08:00",
+        "09:30",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-26",
+        "09:40",
+        "11:10",
+        "Основы российской государственности",
+        "доц. Желтов Андрей Александрович",
+        "к. 2, ауд. 303",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-26",
+        "11:40",
+        "13:10",
+        "Физическая культура и спорт",
+        "ст.пр. Митрофанова Анастасия Геннадьевна",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+
+    (
+        "2026-09-26",
+        "13:20",
+        "14:50",
+        "Физическая культура и спорт",
+        "ст.пр. Митрофанова Анастасия Геннадьевна",
+        "к. 4, ауд. 1а",
+        "Лекция",
+        0
+    ),
+]
+
+
+# ============================================================
+# ЗАПИСЬ РАСПИСАНИЯ В БАЗУ
+# ============================================================
+
+def load_schedule_into_db():
+    cursor = db.cursor()
+
+    # Удаляем только автоматически загруженное расписание.
+    cursor.execute("""
+        DELETE FROM lessons
+        WHERE is_custom = 0
+    """)
+
+    for lesson in SCHEDULE:
+        (
+            lesson_date,
+            start_time,
+            end_time,
+            subject,
+            teacher,
+            room,
+            lesson_type,
+            subgroup
+        ) = lesson
+
+        cursor.execute("""
+            INSERT INTO lessons (
+                lesson_date,
+                start_time,
+                end_time,
+                subject,
+                teacher,
+                room,
+                lesson_type,
+                subgroup,
+                created_by,
+                is_custom
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """, (
+            lesson_date,
+            start_time,
+            end_time,
+            subject,
+            teacher,
+            room,
+            lesson_type,
+            subgroup,
+            0
+        ))
+
+    db.commit()
+
+
+# Загружаем только если база расписания пустая.
+cursor = db.cursor()
+cursor.execute("SELECT COUNT(*) AS count FROM lessons WHERE is_custom = 0")
+schedule_count = cursor.fetchone()["count"]
+
+if schedule_count == 0:
+    load_schedule_into_db()
+
+
+# ============================================================
+# МЕНЮ
+# ============================================================
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📅 Расписание"),
+                KeyboardButton(text="📌 Сегодня")
+            ],
+            [
+                KeyboardButton(text="👤 Моя группа"),
+                KeyboardButton(text="📋 Перекличка")
+            ],
+            [
+                KeyboardButton(text="🗄 База"),
+                KeyboardButton(text="📊 Статистика")
+            ],
+            [
+                KeyboardButton(text="👑 Староста"),
+                KeyboardButton(text="➕ Добавить пару")
+            ],
+            [
+                KeyboardButton(text="🗑 Удалить пару"),
+                KeyboardButton(text="ℹ️ Помощь")
+            ],
+        ],
+        resize_keyboard=True
+    )
+
+
+def subgroup_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🟢 Буду",
-                    callback_data="att:will"
-                ),
+                    text="1️⃣ 1-я подгруппа",
+                    callback_data="subgroup_1"
+                )
+            ],
+            [
                 InlineKeyboardButton(
-                    text="🔴 Не буду",
-                    callback_data="att:wont"
+                    text="2️⃣ 2-я подгруппа",
+                    callback_data="subgroup_2"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 Общие пары",
+                    callback_data="subgroup_0"
+                )
+            ],
+        ]
+    )
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ РАСПИСАНИЯ
+# ============================================================
+
+def get_lessons_for_date(
+    lesson_date: str,
+    subgroup: Optional[int] = None
+):
+    cursor = db.cursor()
+
+    if subgroup is None:
+        cursor.execute("""
+            SELECT *
+            FROM lessons
+            WHERE lesson_date = ?
+            ORDER BY start_time
+        """, (lesson_date,))
+
+    else:
+        cursor.execute("""
+            SELECT *
+            FROM lessons
+            WHERE lesson_date = ?
+            AND (
+                subgroup = 0
+                OR subgroup = ?
+            )
+            ORDER BY start_time
+        """, (
+            lesson_date,
+            subgroup
+        ))
+
+    return cursor.fetchall()
+
+
+def format_lesson(lesson, number: int):
+    text = (
+        f"<b>{number}. {lesson['start_time']}–{lesson['end_time']}</b>\n"
+        f"📚 <b>{lesson['subject']}</b>\n"
+    )
+
+    if lesson["teacher"]:
+        text += f"👨‍🏫 {lesson['teacher']}\n"
+
+    if lesson["room"]:
+        text += f"📍 {lesson['room']}\n"
+
+    if lesson["lesson_type"]:
+        text += f"📝 {lesson['lesson_type']}\n"
+
+    if lesson["subgroup"] == 1:
+        text += "👤 1-я подгруппа\n"
+    elif lesson["subgroup"] == 2:
+        text += "👤 2-я подгруппа\n"
+    else:
+        text += "👥 Общая пара\n"
+
+    return text
+
+
+def attendance_button(lesson):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Я на паре",
+                    callback_data=f"attend_{lesson['id']}"
                 )
             ]
         ]
     )
 
 
-# =========================
-# ДНИ НЕДЕЛИ
-# =========================
-
-def day_name(day):
-
-    days = {
-        1: "Понедельник",
-        2: "Вторник",
-        3: "Среда",
-        4: "Четверг",
-        5: "Пятница",
-        6: "Суббота",
-        7: "Воскресенье"
-    }
-
-    return days[day]
-
-
-# =========================
+# ============================================================
 # START
-# =========================
+# ============================================================
 
-@dp.message(Command("start"))
-async def start(message: Message, state: FSMContext):
+async def start_handler(message: Message):
+    save_user(message)
 
-    await state.clear()
-
-    ensure(message)
-
-    await message.answer(
-        "👋 Бот старосты запущен!\n\n"
-
-        "Пиши команды обычным сообщением:\n\n"
-
-        "👑 староста — назначить себя старостой\n"
-        "📋 перекличка — начать перекличку\n"
-        "📊 результаты — текущие результаты\n"
-        "🛑 завершить — завершить перекличку\n"
-        "📚 история — история перекличек\n"
-        "📈 статистика — статистика посещаемости\n"
-        "📥 выгрузка — скачать всю историю\n\n"
-
-        "📅 добавить пару — добавить пару\n"
-        "🗓 расписание — показать расписание\n"
-        "📌 сегодня — пары сегодня\n"
-        "🗑 удалить пару — удалить пару\n\n"
-
-        "❌ отмена — отменить действие\n"
-        "ℹ️ помощь — список команд"
-    )
-
-
-# =========================
-# ПОМОЩЬ
-# =========================
-
-async def help_command(message: Message):
-
-    await message.answer(
-        "📚 КОМАНДЫ БОТА\n\n"
-
-        "👑 староста\n"
-        "Назначить себя старостой группы.\n\n"
-
-        "📋 перекличка\n"
-        "Начать новую перекличку.\n"
-        "Бот спросит название предмета.\n\n"
-
-        "📊 результаты\n"
-        "Показать ответы текущей переклички.\n\n"
-
-        "🛑 завершить\n"
-        "Закончить текущую перекличку.\n"
-        "Она сохраняется в историю.\n\n"
-
-        "📚 история\n"
-        "Показать последние сохранённые переклички.\n\n"
-
-        "📈 статистика\n"
-        "Показать посещаемость студентов.\n\n"
-
-        "📥 выгрузка\n"
-        "Получить CSV-файл со всей историей.\n\n"
-
-        "📅 добавить пару\n"
-        "Добавить пару в расписание.\n\n"
-
-        "🗓 расписание\n"
-        "Показать всё расписание.\n\n"
-
-        "📌 сегодня\n"
-        "Показать пары на сегодня.\n\n"
-
-        "🗑 удалить пару\n"
-        "Удалить пару из расписания.\n\n"
-
-        "❌ отмена\n"
-        "Отменить текущий ввод."
-    )
-
-
-# =========================
-# РУССКИЕ ТЕКСТОВЫЕ КОМАНДЫ
-# =========================
-
-@dp.message(F.text.lower() == "помощь")
-async def help_text(message: Message):
-
-    ensure(message)
-
-    await help_command(message)
-
-
-@dp.message(F.text.lower() == "отмена")
-async def cancel_text(message: Message, state: FSMContext):
-
-    await state.clear()
-
-    await message.answer(
-        "❌ Текущее действие отменено."
-    )
-
-
-# =========================
-# СТАРОСТА
-# =========================
-
-@dp.message(F.text.lower() == "староста")
-async def set_starosta(message: Message):
-
-    ensure(message)
-
-    with db() as c:
-
-        row = c.execute("""
-        SELECT starosta_id
-        FROM chats
-        WHERE chat_id=?
-        """,
-        (message.chat.id,)).fetchone()
-
-        if (
-            row
-            and row["starosta_id"]
-            and row["starosta_id"] != message.from_user.id
-        ):
-
-            await message.answer(
-                "❌ Староста уже назначен."
-            )
-
-            return
-
-        c.execute("""
-        UPDATE chats
-
-        SET
-            starosta_id=?,
-            starosta_name=?
-
-        WHERE chat_id=?
-        """,
-        (
-            message.from_user.id,
-            message.from_user.full_name,
-            message.chat.id
-        ))
-
-    await message.answer(
-        "👑 Ты назначен старостой этой группы!"
-    )
-
-
-# =========================
-# НАЧАЛО ПЕРЕКЛИЧКИ
-# =========================
-
-@dp.message(F.text.lower() == "перекличка")
-async def rollcall(
-    message: Message,
-    state: FSMContext
-):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    if active(message.chat.id):
-
-        await message.answer(
-            "⚠️ Перекличка уже идёт.\n"
-            "Сначала напиши «завершить»."
-        )
-
-        return
-
-    await state.set_state(
-        States.subject
-    )
-
-    await message.answer(
-        "📚 Напиши название предмета."
-    )
-
-
-# =========================
-# ПРЕДМЕТ ПЕРЕКЛИЧКИ
-# =========================
-
-@dp.message(States.subject)
-async def rollcall_subject(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await admin_only(message):
-        return
-
-    subject = (
-        message.text or ""
-    ).strip()
-
-    if len(subject) < 2:
-
-        await message.answer(
-            "❌ Название предмета слишком короткое."
-        )
-
-        return
-
-    date_text = now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
-
-    with db() as c:
-
-        c.execute("""
-        INSERT INTO rollcalls(
-            chat_id,
-            subject,
-            started_at,
-            status
-        )
-
-        VALUES(
-            ?,
-            ?,
-            ?,
-            'active'
-        )
-        """,
-        (
-            message.chat.id,
-            subject,
-            date_text
-        ))
-
-    await state.clear()
-
-    await message.answer(
-        "📋 ПЕРЕКЛИЧКА\n\n"
-        f"📚 Предмет: {subject}\n"
-        f"📅 Дата: {date_text}\n\n"
-        "Выберите ответ:",
-        reply_markup=attendance_buttons()
-    )
-
-
-# =========================
-# ОТВЕТ НА ПЕРЕКЛИЧКУ
-# =========================
-
-@dp.callback_query(
-    F.data.in_({
-        "att:will",
-        "att:wont"
-    })
-)
-async def vote(call: CallbackQuery):
-
-    chat_id = call.message.chat.id
-
-    rollcall = active(chat_id)
-
-    if not rollcall:
-
-        await call.answer(
-            "Перекличка уже завершена.",
-            show_alert=True
-        )
-
-        return
-
-    if call.data == "att:will":
-
-        status = "Буду"
-
-    else:
-
-        status = "Не буду"
-
-    with db() as c:
-
-        c.execute("""
-        INSERT INTO attendance(
-            rollcall_id,
-            user_id,
-            name,
-            status,
-            answered_at
-        )
-
-        VALUES(
-            ?,
-            ?,
-            ?,
-            ?,
-            ?
-        )
-
-        ON CONFLICT(
-            rollcall_id,
-            user_id
-        )
-
-        DO UPDATE SET
-            name=excluded.name,
-            status=excluded.status,
-            answered_at=excluded.answered_at
-        """,
-        (
-            rollcall["id"],
-            call.from_user.id,
-            call.from_user.full_name,
-            status,
-            now().isoformat()
-        ))
-
-        c.execute("""
-        INSERT INTO students(
-            chat_id,
-            user_id,
-            name,
-            username,
-            first_seen
-        )
-
-        VALUES(
-            ?,
-            ?,
-            ?,
-            ?,
-            ?
-        )
-
-        ON CONFLICT(
-            chat_id,
-            user_id
-        )
-
-        DO UPDATE SET
-            name=excluded.name,
-            username=excluded.username
-        """,
-        (
-            chat_id,
-            call.from_user.id,
-            call.from_user.full_name,
-            call.from_user.username,
-            now().isoformat()
-        ))
-
-    await call.answer(
-        "Ответ сохранён!"
-    )
-
-    await call.message.answer(
-        f"✅ {call.from_user.full_name}: {status}"
-    )
-
-
-# =========================
-# ФОРМИРОВАНИЕ РЕЗУЛЬТАТОВ
-# =========================
-
-def get_results(rollcall_id):
-
-    with db() as c:
-
-        rollcall = c.execute("""
-        SELECT *
-        FROM rollcalls
-        WHERE id=?
-        """,
-        (rollcall_id,)).fetchone()
-
-        rows = c.execute("""
-        SELECT name, status
-        FROM attendance
-        WHERE rollcall_id=?
-        ORDER BY name COLLATE NOCASE
-        """,
-        (rollcall_id,)).fetchall()
-
-    will = [
-        row["name"]
-        for row in rows
-        if row["status"] == "Буду"
-    ]
-
-    wont = [
-        row["name"]
-        for row in rows
-        if row["status"] == "Не буду"
-    ]
+    subgroup = get_user_subgroup(message.from_user.id)
 
     text = (
-        "📊 РЕЗУЛЬТАТЫ\n\n"
-        f"📚 {rollcall['subject']}\n"
-        f"📅 {rollcall['started_at']}\n\n"
+        "👋 <b>Привет!</b>\n\n"
+        "Я бот для расписания и посещаемости.\n\n"
     )
 
-    text += (
-        f"🟢 Будут — {len(will)}\n"
-    )
-
-    if will:
-
-        text += "\n".join(
-            "• " + name
-            for name in will
-        )
-
-    else:
-
-        text += "—"
-
-    text += (
-        f"\n\n🔴 Не будут — {len(wont)}\n"
-    )
-
-    if wont:
-
-        text += "\n".join(
-            "• " + name
-            for name in wont
-        )
-
-    else:
-
-        text += "—"
-
-    return text
-
-
-# =========================
-# РЕЗУЛЬТАТЫ
-# =========================
-
-@dp.message(F.text.lower() == "результаты")
-async def attendance_command(message: Message):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    rollcall = active(
-        message.chat.id
-    )
-
-    if not rollcall:
-
-        await message.answer(
-            "ℹ️ Сейчас нет активной переклички."
-        )
-
-        return
-
-    await message.answer(
-        get_results(
-            rollcall["id"]
-        )
-    )
-
-
-# =========================
-# ЗАВЕРШЕНИЕ
-# =========================
-
-@dp.message(F.text.lower() == "завершить")
-async def finish(message: Message):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    rollcall = active(
-        message.chat.id
-    )
-
-    if not rollcall:
-
-        await message.answer(
-            "ℹ️ Активной переклички нет."
-        )
-
-        return
-
-    result = get_results(
-        rollcall["id"]
-    )
-
-    finished_at = now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
-
-    with db() as c:
-
-        c.execute("""
-        UPDATE rollcalls
-
-        SET
-            status='finished',
-            finished_at=?
-
-        WHERE id=?
-        """,
-        (
-            finished_at,
-            rollcall["id"]
-        ))
-
-    await message.answer(
-        "🛑 Перекличка завершена!\n\n"
-        "💾 Она сохранена в истории.\n\n"
-        + result
-    )
-
-
-# =========================
-# ИСТОРИЯ
-# =========================
-
-@dp.message(F.text.lower() == "история")
-async def history(message: Message):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    with db() as c:
-
-        rows = c.execute("""
-        SELECT *
-        FROM rollcalls
-
-        WHERE
-            chat_id=?
-            AND status='finished'
-
-        ORDER BY id DESC
-
-        LIMIT 20
-        """,
-        (message.chat.id,)).fetchall()
-
-    if not rows:
-
-        await message.answer(
-            "📚 История пока пустая."
-        )
-
-        return
-
-    text = "📚 ИСТОРИЯ ПЕРЕКЛИЧЕК\n\n"
-
-    for row in rows:
-
-        with db() as c:
-
-            will = c.execute("""
-            SELECT COUNT(*)
-            FROM attendance
-
-            WHERE
-                rollcall_id=?
-                AND status='Буду'
-            """,
-            (row["id"],)).fetchone()[0]
-
-            wont = c.execute("""
-            SELECT COUNT(*)
-            FROM attendance
-
-            WHERE
-                rollcall_id=?
-                AND status='Не буду'
-            """,
-            (row["id"],)).fetchone()[0]
-
+    if subgroup is None:
         text += (
-            f"#{row['id']} — "
-            f"{row['subject']}\n"
-            f"📅 {row['started_at']}\n"
-            f"🟢 {will}  🔴 {wont}\n\n"
+            "Сначала выбери свою подгруппу в разделе "
+            "«👤 Моя группа».\n\n"
+        )
+    else:
+        text += (
+            f"Твоя подгруппа: <b>{subgroup}</b>\n\n"
         )
 
-    await message.answer(text)
-
-
-# =========================
-# СТАТИСТИКА
-# =========================
-
-@dp.message(F.text.lower() == "статистика")
-async def statistics(message: Message):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    with db() as c:
-
-        people = c.execute("""
-        SELECT DISTINCT
-            a.user_id,
-            a.name
-
-        FROM attendance a
-
-        JOIN rollcalls r
-            ON r.id=a.rollcall_id
-
-        WHERE
-            r.chat_id=?
-
-        ORDER BY
-            a.name COLLATE NOCASE
-        """,
-        (message.chat.id,)).fetchall()
-
-    if not people:
-
-        await message.answer(
-            "📈 Статистики пока нет."
-        )
-
-        return
-
-    text = "📈 СТАТИСТИКА ПОСЕЩАЕМОСТИ\n\n"
-
-    with db() as c:
-
-        for person in people:
-
-            total = c.execute("""
-            SELECT COUNT(*)
-
-            FROM attendance a
-
-            JOIN rollcalls r
-                ON r.id=a.rollcall_id
-
-            WHERE
-                r.chat_id=?
-                AND a.user_id=?
-                AND r.status='finished'
-            """,
-            (
-                message.chat.id,
-                person["user_id"]
-            )).fetchone()[0]
-
-            present = c.execute("""
-            SELECT COUNT(*)
-
-            FROM attendance a
-
-            JOIN rollcalls r
-                ON r.id=a.rollcall_id
-
-            WHERE
-                r.chat_id=?
-                AND a.user_id=?
-                AND a.status='Буду'
-                AND r.status='finished'
-            """,
-            (
-                message.chat.id,
-                person["user_id"]
-            )).fetchone()[0]
-
-            if total:
-
-                percent = round(
-                    present / total * 100,
-                    1
-                )
-
-            else:
-
-                percent = 0
-
-            text += (
-                f"👤 {person['name']}\n"
-                f"Посещено: "
-                f"{present}/{total} "
-                f"({percent}%)\n\n"
-            )
-
-    await message.answer(text)
-
-
-# =========================
-# ВЫГРУЗКА CSV
-# =========================
-
-@dp.message(F.text.lower() == "выгрузка")
-async def export_csv(message: Message):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    with db() as c:
-
-        rows = c.execute("""
-        SELECT
-            r.id,
-            r.subject,
-            r.started_at,
-            a.user_id,
-            a.name,
-            a.status,
-            a.answered_at
-
-        FROM attendance a
-
-        JOIN rollcalls r
-            ON r.id=a.rollcall_id
-
-        WHERE r.chat_id=?
-
-        ORDER BY
-            r.id DESC,
-            a.name
-        """,
-        (message.chat.id,)).fetchall()
-
-    if not rows:
-
-        await message.answer(
-            "📥 Пока нет данных для выгрузки."
-        )
-
-        return
-
-    output = io.StringIO()
-
-    writer = csv.writer(output)
-
-    writer.writerow([
-        "ID",
-        "Предмет",
-        "Дата",
-        "Telegram ID",
-        "ФИО",
-        "Статус",
-        "Время ответа"
-    ])
-
-    for row in rows:
-
-        writer.writerow([
-            row["id"],
-            row["subject"],
-            row["started_at"],
-            row["user_id"],
-            row["name"],
-            row["status"],
-            row["answered_at"]
-        ])
-
-    data = output.getvalue().encode(
-        "utf-8-sig"
-    )
-
-    await message.answer_document(
-        BufferedInputFile(
-            data,
-            filename="посещаемость.csv"
-        ),
-        caption="📥 История посещаемости"
-    )
-
-
-# =========================
-# ДОБАВЛЕНИЕ ПАРЫ
-# =========================
-
-@dp.message(F.text.lower() == "добавить пару")
-async def add_lesson(
-    message: Message,
-    state: FSMContext
-):
-
-    ensure(message)
-
-    if not await admin_only(message):
-        return
-
-    await state.set_state(
-        States.schedule_subject
+    text += (
+        "Выбирай нужный раздел кнопками ниже 👇"
     )
 
     await message.answer(
-        "📚 Напиши название предмета."
+        text,
+        reply_markup=main_menu()
     )
 
 
-# =========================
-# ПРЕДМЕТ ПАРЫ
-# =========================
+# ============================================================
+# МОЯ ГРУППА
+# ============================================================
 
-@dp.message(States.schedule_subject)
-async def schedule_subject(
-    message: Message,
-    state: FSMContext
-):
+async def my_group_handler(message: Message):
+    save_user(message)
 
-    subject = (
-        message.text or ""
-    ).strip()
+    subgroup = get_user_subgroup(message.from_user.id)
 
-    if not subject:
-
+    if subgroup:
         await message.answer(
-            "❌ Напиши название предмета."
+            f"👤 Сейчас выбрана <b>{subgroup}-я подгруппа</b>.\n\n"
+            "Если нужно изменить — выбери ниже:",
+            reply_markup=subgroup_keyboard()
         )
-
-        return
-
-    await state.update_data(
-        subject=subject
-    )
-
-    await state.set_state(
-        States.schedule_day
-    )
-
-    await message.answer(
-        "📅 Напиши день недели числом:\n\n"
-        "1 — Понедельник\n"
-        "2 — Вторник\n"
-        "3 — Среда\n"
-        "4 — Четверг\n"
-        "5 — Пятница\n"
-        "6 — Суббота\n"
-        "7 — Воскресенье"
-    )
-
-
-# =========================
-# ДЕНЬ ПАРЫ
-# =========================
-
-@dp.message(States.schedule_day)
-async def schedule_day(
-    message: Message,
-    state: FSMContext
-):
-
-    value = (
-        message.text or ""
-    ).strip()
-
-    if value not in (
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7"
-    ):
-
+    else:
         await message.answer(
-            "❌ Напиши число от 1 до 7."
+            "👤 Выбери свою подгруппу:",
+            reply_markup=subgroup_keyboard()
         )
 
-        return
 
-    await state.update_data(
-        day=int(value)
+async def subgroup_callback(callback: CallbackQuery):
+    subgroup = int(callback.data.split("_")[1])
+
+    set_user_subgroup(
+        callback.from_user.id,
+        subgroup
     )
 
-    await state.set_state(
-        States.schedule_time
-    )
+    if subgroup == 0:
+        text = "👥 Теперь выбраны общие пары."
+    else:
+        text = f"✅ Выбрана <b>{subgroup}-я подгруппа</b>."
 
-    await message.answer(
-        "⏰ Напиши время начала пары.\n\n"
-        "Например: 09:00"
-    )
+    await callback.message.edit_text(text)
 
-
-# =========================
-# ВРЕМЯ ПАРЫ
-# =========================
-
-@dp.message(States.schedule_time)
-async def schedule_time(
-    message: Message,
-    state: FSMContext
-):
-
-    value = (
-        message.text or ""
-    ).strip()
-
-    try:
-
-        datetime.strptime(
-            value,
-            "%H:%M"
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Неверный формат.\n"
-            "Например: 09:00"
-        )
-
-        return
-
-    data = await state.get_data()
-
-    with db() as c:
-
-        c.execute("""
-        INSERT INTO schedule(
-            chat_id,
-            subject,
-            day,
-            lesson_time
-        )
-
-        VALUES(
-            ?,
-            ?,
-            ?,
-            ?
-        )
-        """,
-        (
-            message.chat.id,
-            data["subject"],
-            data["day"],
-            value
-        ))
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Пара добавлена!\n\n"
-        f"📚 {data['subject']}\n"
-        f"📅 {day_name(data['day'])}\n"
-        f"⏰ {value}"
-    )
+    await callback.answer("Сохранено")
 
 
-# =========================
+# ============================================================
 # РАСПИСАНИЕ
-# =========================
+# ============================================================
 
-@dp.message(F.text.lower() == "расписание")
-async def schedule(message: Message):
+async def schedule_handler(message: Message):
+    save_user(message)
 
-    ensure(message)
+    subgroup = get_user_subgroup(message.from_user.id)
 
-    with db() as c:
+    if subgroup is None:
+        await message.answer(
+            "Сначала выбери свою подгруппу:",
+            reply_markup=subgroup_keyboard()
+        )
+        return
 
-        rows = c.execute("""
-        SELECT *
-        FROM schedule
+    cursor = db.cursor()
 
-        WHERE
-            chat_id=?
-            AND enabled=1
+    cursor.execute("""
+        SELECT DISTINCT lesson_date
+        FROM lessons
+        ORDER BY lesson_date
+    """)
 
-        ORDER BY
-            day,
-            lesson_time
-        """,
-        (message.chat.id,)).fetchall()
+    dates = [row["lesson_date"] for row in cursor.fetchall()]
 
-    if not rows:
-
+    if not dates:
         await message.answer(
             "📅 Расписание пока пустое."
         )
-
         return
 
-    text = "📅 РАСПИСАНИЕ\n"
+    text = "📅 <b>Расписание</b>\n\n"
 
-    current_day = 0
+    for d in dates:
+        lessons = get_lessons_for_date(d, subgroup)
 
-    for row in rows:
+        if not lessons:
+            continue
 
-        if row["day"] != current_day:
+        formatted_date = datetime.strptime(
+            d,
+            "%Y-%m-%d"
+        ).strftime("%d.%m.%Y")
 
-            current_day = row["day"]
+        text += f"🗓 <b>{formatted_date}</b>\n"
 
-            text += (
-                f"\n📌 {day_name(current_day)}\n"
-            )
+        for i, lesson in enumerate(lessons, 1):
+            text += format_lesson(lesson, i)
+            text += "\n"
 
-        text += (
-            f"⏰ {row['lesson_time']} — "
-            f"{row['subject']} "
-            f"(ID: {row['id']})\n"
-        )
+        text += "──────────────\n"
 
     await message.answer(text)
 
 
-# =========================
+# ============================================================
 # СЕГОДНЯ
-# =========================
+# ============================================================
 
-@dp.message(F.text.lower() == "сегодня")
-async def today(message: Message):
+async def today_handler(message: Message):
+    save_user(message)
 
-    ensure(message)
+    subgroup = get_user_subgroup(message.from_user.id)
 
-    day = now().isoweekday()
-
-    with db() as c:
-
-        rows = c.execute("""
-        SELECT *
-        FROM schedule
-
-        WHERE
-            chat_id=?
-            AND day=?
-            AND enabled=1
-
-        ORDER BY lesson_time
-        """,
-        (
-            message.chat.id,
-            day
-        )).fetchall()
-
-    if not rows:
-
+    if subgroup is None:
         await message.answer(
-            f"📌 Сегодня — {day_name(day)}.\n\n"
-            "Пар нет."
+            "Сначала выбери свою подгруппу:",
+            reply_markup=subgroup_keyboard()
         )
+        return
 
+    current_date = today_str()
+
+    lessons = get_lessons_for_date(
+        current_date,
+        subgroup
+    )
+
+    formatted_date = datetime.now().strftime(
+        "%d.%m.%Y"
+    )
+
+    if not lessons:
+        await message.answer(
+            f"📌 <b>Сегодня {formatted_date}</b>\n\n"
+            "Пар по расписанию нет."
+        )
         return
 
     text = (
-        f"📌 СЕГОДНЯ — "
-        f"{day_name(day)}\n\n"
+        f"📌 <b>Сегодня — {formatted_date}</b>\n\n"
     )
 
-    for row in rows:
+    for i, lesson in enumerate(lessons, 1):
+        text += format_lesson(lesson, i)
+        text += "\n"
+
+    await message.answer(text)
+
+    # Отдельно показываем кнопки отметки.
+    for lesson in lessons:
+        await message.answer(
+            (
+                f"📚 <b>{lesson['subject']}</b>\n"
+                f"⏰ {lesson['start_time']}–{lesson['end_time']}"
+            ),
+            reply_markup=attendance_button(lesson)
+        )
+
+
+# ============================================================
+# ОТМЕТКА
+# ============================================================
+
+async def attendance_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    lesson_id = int(
+        callback.data.split("_")[1]
+    )
+
+    cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT * FROM lessons WHERE id = ?",
+        (lesson_id,)
+    )
+
+    lesson = cursor.fetchone()
+
+    if not lesson:
+        await callback.answer(
+            "Пара не найдена",
+            show_alert=True
+        )
+        return
+
+    user_subgroup = get_user_subgroup(user_id)
+
+    if user_subgroup is None:
+        await callback.answer(
+            "Сначала выбери свою подгруппу",
+            show_alert=True
+        )
+        return
+
+    # Проверяем принадлежность к подгруппе.
+    if lesson["subgroup"] not in (0, user_subgroup):
+        await callback.answer(
+            "Эта пара относится к другой подгруппе",
+            show_alert=True
+        )
+        return
+
+    cursor.execute("""
+        SELECT id
+        FROM attendance
+        WHERE telegram_id = ?
+        AND lesson_id = ?
+        AND lesson_date = ?
+    """, (
+        user_id,
+        lesson_id,
+        lesson["lesson_date"]
+    ))
+
+    already = cursor.fetchone()
+
+    if already:
+        await callback.answer(
+            "Ты уже отмечен на этой паре ✅",
+            show_alert=True
+        )
+        return
+
+    cursor.execute("""
+        INSERT INTO attendance (
+            telegram_id,
+            lesson_id,
+            lesson_date,
+            subject,
+            start_time,
+            end_time,
+            marked_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        lesson_id,
+        lesson["lesson_date"],
+        lesson["subject"],
+        lesson["start_time"],
+        lesson["end_time"],
+        now_str()
+    ))
+
+    db.commit()
+
+    await callback.answer(
+        "Ты успешно отмечен! ✅",
+        show_alert=True
+    )
+
+
+# ============================================================
+# ПЕРЕКЛИЧКА
+# ============================================================
+
+async def attendance_list_handler(message: Message):
+    save_user(message)
+
+    if not is_starosta(message.from_user.id):
+        await message.answer(
+            "⛔ Этот раздел доступен только старосте."
+        )
+        return
+
+    current_date = today_str()
+
+    cursor = db.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM lessons
+        WHERE lesson_date = ?
+        ORDER BY start_time
+    """, (current_date,))
+
+    lessons = cursor.fetchall()
+
+    if not lessons:
+        await message.answer(
+            "📋 Сегодня пар нет."
+        )
+        return
+
+    text = (
+        f"📋 <b>Перекличка на "
+        f"{datetime.now().strftime('%d.%m.%Y')}</b>\n\n"
+    )
+
+    for lesson in lessons:
 
         text += (
-            f"⏰ {row['lesson_time']} — "
-            f"{row['subject']}\n"
+            f"📚 <b>{lesson['subject']}</b>\n"
+            f"⏰ {lesson['start_time']}–{lesson['end_time']}\n"
         )
+
+        cursor.execute("""
+            SELECT
+                u.full_name,
+                u.username,
+                u.subgroup,
+                a.marked_at
+            FROM attendance a
+            JOIN users u
+                ON u.telegram_id = a.telegram_id
+            WHERE a.lesson_id = ?
+            AND a.lesson_date = ?
+            ORDER BY u.full_name
+        """, (
+            lesson["id"],
+            current_date
+        ))
+
+        students = cursor.fetchall()
+
+        if not students:
+            text += "❌ Пока никто не отметился.\n\n"
+            continue
+
+        for student in students:
+            name = student["full_name"] or "Без имени"
+
+            if student["username"]:
+                name += f" (@{student['username']})"
+
+            text += f"✅ {name}\n"
+
+        text += "\n"
 
     await message.answer(text)
 
 
-# =========================
-# УДАЛЕНИЕ ПАРЫ
-# =========================
+# ============================================================
+# СТАТИСТИКА
+# ============================================================
 
-@dp.message(F.text.lower().startswith("удалить пару"))
-async def delete_lesson(message: Message):
+async def statistics_handler(message: Message):
+    save_user(message)
 
-    ensure(message)
-
-    if not await admin_only(message):
+    if not is_starosta(message.from_user.id):
+        await message.answer(
+            "⛔ Статистика доступна только старосте."
+        )
         return
 
-    parts = (
-        message.text or ""
-    ).split()
+    cursor = db.cursor()
 
-    if len(parts) == 3:
+    cursor.execute("""
+        SELECT COUNT(*) AS count
+        FROM users
+    """)
 
-        lesson_id = parts[2]
+    total_users = cursor.fetchone()["count"]
 
-        if lesson_id.isdigit():
+    cursor.execute("""
+        SELECT COUNT(*) AS count
+        FROM attendance
+    """)
 
-            lesson_id = int(
-                lesson_id
+    total_attendance = cursor.fetchone()["count"]
+
+    cursor.execute("""
+        SELECT
+            u.full_name,
+            u.username,
+            COUNT(a.id) AS visits
+        FROM users u
+        LEFT JOIN attendance a
+            ON a.telegram_id = u.telegram_id
+        GROUP BY u.telegram_id
+        ORDER BY visits DESC, u.full_name
+    """)
+
+    students = cursor.fetchall()
+
+    text = (
+        "📊 <b>Статистика посещаемости</b>\n\n"
+        f"👥 Студентов в базе: <b>{total_users}</b>\n"
+        f"✅ Всего отметок: <b>{total_attendance}</b>\n\n"
+    )
+
+    if students:
+        text += "<b>По студентам:</b>\n\n"
+
+        for student in students:
+            name = student["full_name"] or "Без имени"
+
+            if student["username"]:
+                name += f" (@{student['username']})"
+
+            text += (
+                f"👤 {name}\n"
+                f"   Посещений: <b>{student['visits']}</b>\n\n"
             )
 
-            with db() as c:
+    await message.answer(text)
 
-                row = c.execute("""
-                SELECT *
-                FROM schedule
 
-                WHERE
-                    id=?
-                    AND chat_id=?
-                    AND enabled=1
-                """,
-                (
-                    lesson_id,
-                    message.chat.id
-                )).fetchone()
+# ============================================================
+# БАЗА
+# ============================================================
 
-                if not row:
+async def database_handler(message: Message):
+    save_user(message)
 
-                    await message.answer(
-                        "❌ Пара с таким ID не найдена."
+    if not is_starosta(message.from_user.id):
+        await message.answer(
+            "⛔ База доступна только старосте."
+        )
+        return
+
+    cursor = db.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*) AS count
+        FROM users
+    """)
+
+    users_count = cursor.fetchone()["count"]
+
+    cursor.execute("""
+        SELECT COUNT(*) AS count
+        FROM attendance
+    """)
+
+    attendance_count = cursor.fetchone()["count"]
+
+    cursor.execute("""
+        SELECT COUNT(*) AS count
+        FROM lessons
+    """)
+
+    lessons_count = cursor.fetchone()["count"]
+
+    starosta_id = get_starosta_id()
+
+    text = (
+        "🗄 <b>База данных</b>\n\n"
+        f"👥 Пользователей: <b>{users_count}</b>\n"
+        f"📅 Пар в базе: <b>{lessons_count}</b>\n"
+        f"✅ Отметок: <b>{attendance_count}</b>\n\n"
+    )
+
+    if starosta_id:
+        text += f"👑 Староста: <code>{starosta_id}</code>\n"
+    else:
+        text += "👑 Староста пока не назначен.\n"
+
+    await message.answer(text)
+
+
+# ============================================================
+# СТАРОСТА
+# ============================================================
+
+async def starosta_handler(message: Message):
+    save_user(message)
+
+    current_starosta = get_starosta_id()
+
+    if is_starosta(message.from_user.id):
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="❌ Снять себя со старосты",
+                        callback_data="remove_starosta"
                     )
+                ]
+            ]
+        )
 
-                    return
+        await message.answer(
+            "👑 <b>Ты сейчас староста.</b>\n\n"
+            "Тебе доступны:\n"
+            "• перекличка\n"
+            "• статистика\n"
+            "• база\n"
+            "• добавление пар\n"
+            "• удаление пар",
+            reply_markup=keyboard
+        )
+        return
 
-                c.execute("""
-                UPDATE schedule
+    if current_starosta:
+        await message.answer(
+            "👑 Староста уже назначен."
+        )
+        return
 
-                SET enabled=0
+    if OWNER_ID is not None and message.from_user.id != OWNER_ID:
+        await message.answer(
+            "⛔ Назначить старосту может только владелец бота."
+        )
+        return
 
-                WHERE id=?
-                """,
-                (lesson_id,))
-
-            await message.answer(
-                "🗑 Пара удалена!\n\n"
-                f"📚 {row['subject']}\n"
-                f"📅 {day_name(row['day'])}\n"
-                f"⏰ {row['lesson_time']}"
-            )
-
-            return
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👑 Стать старостой",
+                    callback_data="become_starosta"
+                )
+            ]
+        ]
+    )
 
     await message.answer(
-        "Используй:\n\n"
-        "удалить пару ID\n\n"
-        "Например:\n"
-        "удалить пару 3"
+        "👑 <b>Староста ещё не назначен.</b>\n\n"
+        "Если это ты — нажми кнопку:",
+        reply_markup=keyboard
     )
 
 
-# =========================
-# НАПОМИНАНИЯ
-# =========================
+async def become_starosta_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
 
-async def reminder_loop():
+    current = get_starosta_id()
 
-    sent = set()
+    if current:
+        await callback.answer(
+            "Староста уже назначен.",
+            show_alert=True
+        )
+        return
 
-    while True:
+    if OWNER_ID is not None and user_id != OWNER_ID:
+        await callback.answer(
+            "У тебя нет прав на назначение старосты.",
+            show_alert=True
+        )
+        return
 
-        try:
+    set_starosta_id(user_id)
 
-            current = now()
+    await callback.message.edit_text(
+        "👑 <b>Ты назначен старостой!</b>\n\n"
+        "Теперь тебе доступны перекличка, статистика и база."
+    )
 
-            day = current.isoweekday()
+    await callback.answer("Готово!")
 
-            with db() as c:
 
-                rows = c.execute("""
-                SELECT *
-                FROM schedule
+async def remove_starosta_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
 
-                WHERE
-                    day=?
-                    AND enabled=1
-                """,
-                (day,)).fetchall()
+    if not is_starosta(user_id):
+        await callback.answer(
+            "Ты не являешься старостой.",
+            show_alert=True
+        )
+        return
 
-            for row in rows:
+    remove_starosta()
 
-                hour, minute = map(
-                    int,
-                    row["lesson_time"].split(":")
-                )
+    await callback.message.edit_text(
+        "✅ Ты больше не являешься старостой."
+    )
 
-                lesson = current.replace(
-                    hour=hour,
-                    minute=minute,
-                    second=0,
-                    microsecond=0
-                )
+    await callback.answer("Староста снят")
 
-                minutes = (
-                    lesson - current
-                ).total_seconds() / 60
 
-                key = (
-                    row["id"],
-                    current.date()
-                )
+# ============================================================
+# ДОБАВЛЕНИЕ ПАРЫ
+# ============================================================
 
-                if (
-                    0 <= minutes <= row["reminder"]
-                    and key not in sent
-                ):
+# Ввод:
+#
+# 28.09.2026 | 08:00 | 09:30 | Математика | Иванов И.И. | ауд. 101 | Лекция | 0
+#
+# subgroup:
+# 0 = общая
+# 1 = первая
+# 2 = вторая
 
-                    if not active(
-                        row["chat_id"]
-                    ):
 
-                        await bot.send_message(
-                            row["chat_id"],
-                            "⏰ НАПОМИНАНИЕ\n\n"
-                            f"Через {max(1, round(minutes))} "
-                            f"мин. пара:\n"
-                            f"📚 {row['subject']}\n\n"
-                            "Староста может начать "
-                            "перекличку, написав:\n"
-                            "перекличка"
-                        )
+def parse_lesson_text(text: str):
+    parts = [
+        x.strip()
+        for x in text.split("|")
+    ]
 
-                    sent.add(key)
+    if len(parts) != 8:
+        return None
 
-            sent = {
-                item
-                for item in sent
-                if item[1] == current.date()
-            }
+    (
+        lesson_date,
+        start_time,
+        end_time,
+        subject,
+        teacher,
+        room,
+        lesson_type,
+        subgroup
+    ) = parts
 
-        except Exception as error:
+    try:
+        datetime.strptime(
+            lesson_date,
+            "%d.%m.%Y"
+        )
 
-            print(
-                "Ошибка напоминаний:",
-                error
+        datetime.strptime(
+            start_time,
+            "%H:%M"
+        )
+
+        datetime.strptime(
+            end_time,
+            "%H:%M"
+        )
+
+        subgroup = int(subgroup)
+
+        if subgroup not in (0, 1, 2):
+            return None
+
+    except Exception:
+        return None
+
+    normalized_date = datetime.strptime(
+        lesson_date,
+        "%d.%m.%Y"
+    ).strftime("%Y-%m-%d")
+
+    return (
+        normalized_date,
+        start_time,
+        end_time,
+        subject,
+        teacher,
+        room,
+        lesson_type,
+        subgroup
+    )
+
+
+async def add_lesson_handler(message: Message):
+    save_user(message)
+
+    if not is_starosta(message.from_user.id):
+        await message.answer(
+            "⛔ Добавлять пары может только староста."
+        )
+        return
+
+    await message.answer(
+        "➕ <b>Добавление пары</b>\n\n"
+        "Отправь одной строкой в формате:\n\n"
+        "<code>"
+        "28.09.2026 | 08:00 | 09:30 | Математика | "
+        "Иванов И.И. | ауд. 101 | Лекция | 0"
+        "</code>\n\n"
+        "Последняя цифра:\n"
+        "0 — общая пара\n"
+        "1 — 1-я подгруппа\n"
+        "2 — 2-я подгруппа"
+    )
+
+
+async def add_lesson_text_handler(message: Message):
+    if not is_starosta(message.from_user.id):
+        return
+
+    # Не перехватываем обычные сообщения.
+    text = message.text or ""
+
+    if "|" not in text:
+        return
+
+    lesson = parse_lesson_text(text)
+
+    if not lesson:
+        return
+
+    (
+        lesson_date,
+        start_time,
+        end_time,
+        subject,
+        teacher,
+        room,
+        lesson_type,
+        subgroup
+    ) = lesson
+
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO lessons (
+            lesson_date,
+            start_time,
+            end_time,
+            subject,
+            teacher,
+            room,
+            lesson_type,
+            subgroup,
+            created_by,
+            is_custom
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    """, (
+        lesson_date,
+        start_time,
+        end_time,
+        subject,
+        teacher,
+        room,
+        lesson_type,
+        subgroup,
+        message.from_user.id
+    ))
+
+    db.commit()
+
+    await message.answer(
+        "✅ <b>Пара добавлена.</b>\n\n"
+        f"📅 {datetime.strptime(lesson_date, '%Y-%m-%d').strftime('%d.%m.%Y')}\n"
+        f"⏰ {start_time}–{end_time}\n"
+        f"📚 {subject}\n"
+        f"👨‍🏫 {teacher}\n"
+        f"📍 {room}\n"
+        f"📝 {lesson_type}\n"
+        f"👤 Подгруппа: {subgroup}"
+    )
+
+
+# ============================================================
+# УДАЛЕНИЕ ПАР
+# ============================================================
+
+async def delete_lesson_handler(message: Message):
+    save_user(message)
+
+    if not is_starosta(message.from_user.id):
+        await message.answer(
+            "⛔ Удалять пары может только староста."
+        )
+        return
+
+    cursor = db.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM lessons
+        WHERE lesson_date >= ?
+        ORDER BY lesson_date, start_time
+    """, (today_str(),))
+
+    lessons = cursor.fetchall()
+
+    if not lessons:
+        await message.answer(
+            "🗑 Удалять пока нечего."
+        )
+        return
+
+    buttons = []
+
+    for lesson in lessons[:50]:
+        date_text = datetime.strptime(
+            lesson["lesson_date"],
+            "%Y-%m-%d"
+        ).strftime("%d.%m")
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=(
+                    f"🗑 {date_text} "
+                    f"{lesson['start_time']} "
+                    f"{lesson['subject'][:25]}"
+                ),
+                callback_data=f"delete_{lesson['id']}"
             )
+        ])
 
-        await asyncio.sleep(60)
+    await message.answer(
+        "🗑 <b>Выбери пару для удаления:</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
 
 
-# =========================
-# ЗАПУСК
-# =========================
+async def delete_lesson_callback(callback: CallbackQuery):
+    if not is_starosta(callback.from_user.id):
+        await callback.answer(
+            "Только староста может удалять пары.",
+            show_alert=True
+        )
+        return
+
+    lesson_id = int(
+        callback.data.split("_")[1]
+    )
+
+    cursor = db.cursor()
+
+    cursor.execute(
+        "SELECT * FROM lessons WHERE id = ?",
+        (lesson_id,)
+    )
+
+    lesson = cursor.fetchone()
+
+    if not lesson:
+        await callback.answer(
+            "Пара уже удалена.",
+            show_alert=True
+        )
+        return
+
+    cursor.execute(
+        "DELETE FROM lessons WHERE id = ?",
+        (lesson_id,)
+    )
+
+    db.commit()
+
+    await callback.message.edit_text(
+        "🗑 <b>Пара удалена.</b>\n\n"
+        f"📚 {lesson['subject']}\n"
+        f"📅 {datetime.strptime(lesson['lesson_date'], '%Y-%m-%d').strftime('%d.%m.%Y')}\n"
+        f"⏰ {lesson['start_time']}–{lesson['end_time']}"
+    )
+
+    await callback.answer("Удалено")
+
+
+# ============================================================
+# ПОМОЩЬ
+# ============================================================
+
+async def help_handler(message: Message):
+    save_user(message)
+
+    text = (
+        "ℹ️ <b>Помощь</b>\n\n"
+
+        "📅 <b>Расписание</b>\n"
+        "Показывает расписание по выбранной подгруппе.\n\n"
+
+        "📌 <b>Сегодня</b>\n"
+        "Показывает пары на сегодня и позволяет "
+        "самостоятельно отметиться.\n\n"
+
+        "👤 <b>Моя группа</b>\n"
+        "Выбор 1-й или 2-й подгруппы.\n\n"
+
+        "📋 <b>Перекличка</b>\n"
+        "Староста видит, кто отметился на сегодняшних парах.\n\n"
+
+        "📊 <b>Статистика</b>\n"
+        "Сводная статистика посещаемости.\n\n"
+
+        "🗄 <b>База</b>\n"
+        "Количество студентов, пар и отметок.\n\n"
+
+        "👑 <b>Староста</b>\n"
+        "Назначение старосты.\n\n"
+
+        "➕ <b>Добавить пару</b>\n"
+        "Добавление новой пары вручную.\n\n"
+
+        "🗑 <b>Удалить пару</b>\n"
+        "Удаление пары из расписания."
+    )
+
+    await message.answer(text)
+
+
+# ============================================================
+# РАСПОЗНАВАНИЕ КНОПОК
+# ============================================================
+
+async def menu_router(message: Message):
+
+    text = message.text
+
+    if text == "📅 Расписание":
+        await schedule_handler(message)
+
+    elif text == "📌 Сегодня":
+        await today_handler(message)
+
+    elif text == "👤 Моя группа":
+        await my_group_handler(message)
+
+    elif text == "📋 Перекличка":
+        await attendance_list_handler(message)
+
+    elif text == "🗄 База":
+        await database_handler(message)
+
+    elif text == "📊 Статистика":
+        await statistics_handler(message)
+
+    elif text == "👑 Староста":
+        await starosta_handler(message)
+
+    elif text == "➕ Добавить пару":
+        await add_lesson_handler(message)
+
+    elif text == "🗑 Удалить пару":
+        await delete_lesson_handler(message)
+
+    elif text == "ℹ️ Помощь":
+        await help_handler(message)
+
+
+# ============================================================
+# КОМАНДЫ ДЛЯ УДОБСТВА
+# ============================================================
+
+async def command_help(message: Message):
+    await help_handler(message)
+
+
+# ============================================================
+# ЗАПУСК БОТА
+# ============================================================
 
 async def main():
 
-    init_db()
-
-    print(
-        "BOT STARTED"
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        )
     )
 
-    await asyncio.gather(
-        dp.start_polling(bot),
-        reminder_loop()
+    dp = Dispatcher()
+
+    # Команды
+    dp.message.register(
+        start_handler,
+        CommandStart()
     )
+
+    dp.message.register(
+        command_help,
+        Command("help")
+    )
+
+    # Callback-кнопки
+    dp.callback_query.register(
+        subgroup_callback,
+        F.data.startswith("subgroup_")
+    )
+
+    dp.callback_query.register(
+        attendance_callback,
+        F.data.startswith("attend_")
+    )
+
+    dp.callback_query.register(
+        become_starosta_callback,
+        F.data == "become_starosta"
+    )
+
+    dp.callback_query.register(
+        remove_starosta_callback,
+        F.data == "remove_starosta"
+    )
+
+    dp.callback_query.register(
+        delete_lesson_callback,
+        F.data.startswith("delete_")
+    )
+
+    # Текстовые кнопки меню
+    dp.message.register(
+        menu_router,
+        F.text
+    )
+
+    # Добавление пары через строку с |
+    dp.message.register(
+        add_lesson_text_handler,
+        F.text
+    )
+
+    print("Бот запущен...")
+
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-
     asyncio.run(main())
